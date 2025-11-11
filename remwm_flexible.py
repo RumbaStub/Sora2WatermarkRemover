@@ -1,4 +1,4 @@
-%%writefile remwm_flexible.py
+
 # This is the full script with our modifications.
 # Running this cell will save the script as 'remwm_flexible.py' in your Colab environment.
 
