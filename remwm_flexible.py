@@ -1,3 +1,7 @@
+%%writefile remwm_flexible.py
+# This is the full script with our modifications.
+# Running this cell will save the script as 'remwm_flexible.py' in your Colab environment.
+
 import sys
 import click
 from pathlib import Path
@@ -114,24 +118,24 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     # Determine output format
     if force_format:
         output_format = force_format.upper()
     else:
         output_format = "MP4"  # Default to MP4 for videos
-    
+
     # Create output video file
     output_path = Path(output_path)
     if output_path.is_dir():
         output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
     else:
         output_file = output_path.with_suffix(f".{output_format.lower()}")
-    
+
     # Créer un fichier temporaire pour la vidéo sans audio
     temp_dir = tempfile.mkdtemp()
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
-    
+
     # Set codec based on output format
     if output_format.upper() == "MP4":
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -139,9 +143,9 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
     else:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to MP4
-    
+
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps_out, (width, height))
-    
+
     # Process each frame
     with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
         frame_count = 0
@@ -150,7 +154,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             # Frame skip control
             if frame_idx % frame_step != 0:
                 frame_idx += 1
@@ -158,14 +162,14 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 progress = int((frame_idx / total_frames) * 100)
                 print(f"Processing frame {frame_idx}/{total_frames}, progress:{progress}%")
                 continue
-            
+
             # Convert frame to PIL Image
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
-            
+
             # Get watermark mask
             mask_image = get_watermark_mask(pil_image, florence_model, florence_processor, device, max_bbox_percent)
-            
+
             # Process frame
             if transparent:
                 # For video, we can't use transparency, so we'll fill with a color or background
@@ -177,26 +181,26 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             else:
                 lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
                 result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-            
+
             # Convert back to OpenCV format and write to output video
             frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             out.write(frame_result)
-            
+
             # Update progress
             frame_count += 1
             frame_idx += 1
             pbar.update(1)
             progress = int((frame_idx / total_frames) * 100)
             print(f"Processing frame {frame_idx}/{total_frames}, progress:{progress}%")
-    
+
     # Release resources
     cap.release()
     out.release()
-    
+
     # Combiner la vidéo traitée avec l'audio original à l'aide de FFmpeg
     try:
         logger.info("Fusion de la vidéo traitée avec l'audio original...")
-        
+
         # Vérifier si FFmpeg est disponible
         try:
             subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
@@ -216,7 +220,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 "-shortest",                  # Terminer quand la piste la plus courte se termine
                 str(output_file)
             ]
-            
+
             # Exécuter FFmpeg
             subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             logger.info("Fusion audio/vidéo terminée avec succès!")
@@ -231,7 +235,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             os.rmdir(temp_dir)
         except:
             pass
-    
+
     logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
     return output_file
 
@@ -263,7 +267,7 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         output_format = image_path.suffix[1:].upper()
         if output_format not in ["PNG", "WEBP", "JPG"]:
             output_format = "PNG"
-    
+
     # Map JPG to JPEG for PIL compatibility
     if output_format == "JPG":
         output_format = "JPEG"
@@ -280,13 +284,15 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
 @click.command()
 @click.argument("input_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path())
+# -------------------- CHANGE 1: ADD NEW --model OPTION --------------------
+@click.option("--model", type=click.Choice(['lama', 'migan']), default='lama', help="Inpainting model to use (lama or migan).")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing files in bulk mode.")
 @click.option("--transparent", is_flag=True, help="Make watermark regions transparent instead of removing.")
 @click.option("--max-bbox-percent", default=10.0, help="Maximum percentage of the image that a bounding box can cover.")
 @click.option("--force-format", type=click.Choice(["PNG", "WEBP", "JPG", "MP4", "AVI"], case_sensitive=False), default=None, help="Force output format. Defaults to input format.")
 @click.option("--frame-step", default=1, type=int, help="Process every Nth frame (1=all frames, 2=every other frame)")
 @click.option("--target-fps", default=0.0, type=float, help="Target output FPS (0=same as input)")
-def main(input_path: str, output_path: str, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, frame_step: int, target_fps: float):
+def main(input_path: str, output_path: str, model: str, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, frame_step: int, target_fps: float):
     # Input validation
     if frame_step < 1:
         logger.error("frame_step must be >= 1")
@@ -294,7 +300,7 @@ def main(input_path: str, output_path: str, overwrite: bool, transparent: bool, 
     if target_fps < 0:
         logger.error("target_fps must be >= 0")
         sys.exit(1)
-    
+
     input_path = Path(input_path)
     output_path = Path(output_path)
 
@@ -305,8 +311,9 @@ def main(input_path: str, output_path: str, overwrite: bool, transparent: bool, 
     logger.info("Florence-2 Model loaded")
 
     if not transparent:
-        model_manager = ModelManager(name="lama", device=device)
-        logger.info("LaMa model loaded")
+        # -------------------- CHANGE 2: USE THE 'model' VARIABLE --------------------
+        model_manager = ModelManager(name=model, device=device)
+        logger.info(f"{model.capitalize()} model loaded")
     else:
         model_manager = None
 
@@ -333,7 +340,7 @@ def main(input_path: str, output_path: str, overwrite: bool, transparent: bool, 
                 output_file = output_path.with_suffix(f".{force_format.lower()}")
             else:
                 output_file = output_path.with_suffix(".mp4")  # Default to mp4
-        
+
         handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, frame_step, target_fps)
         print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
 
