@@ -1,7 +1,14 @@
-# Updated script with batch processing capabilities and tensor fix
+# Final corrected script with all imports and batch processing
 import sys
 import click
-# ... (all other imports are the same) ...
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+# --- THIS IS THE CORRECTED LINE ---
+from transformers import AutoProcessor, AutoModelForCausalLM
+from iopaint.model_manager import ModelManager
+from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import torch
 import tqdm
 from loguru import logger
@@ -19,14 +26,9 @@ except ImportError:
 class TaskType(str, Enum):
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
 
-# --- The ONLY CHANGE is in this function ---
 def identify(task_prompt: TaskType, images: list, text_input: str, model: AutoModelForCausalLM, processor: AutoProcessor, device: str):
     prompt = task_prompt.value if text_input is None else task_prompt.value + text_input
-    
-    # --- MODIFIED LINE ---
-    # Instead of a single prompt, create a list of prompts matching the batch size.
     inputs = processor(text=[prompt] * len(images), images=images, return_tensors="pt").to(device)
-    
     generated_ids = model.generate(**inputs, max_new_tokens=1024, early_stopping=False, do_sample=False, num_beams=3)
     generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
     
@@ -36,11 +38,9 @@ def identify(task_prompt: TaskType, images: list, text_input: str, model: AutoMo
         results.append(processor.post_process_generation(generated_text, task=task_prompt.value, image_size=image_size))
     return results
 
-# ... (The rest of the file, including get_watermark_masks_batch, process_batch, process_video, and main, is exactly the same as before) ...
 def get_watermark_masks_batch(images: list, model: AutoModelForCausalLM, processor: AutoProcessor, device: str, max_bbox_percent: float):
     text_input = "watermark Sora logo"
     parsed_answers = identify(TaskType.OPEN_VOCAB_DETECTION, images, text_input, model, processor, device)
-
     masks = []
     for i, parsed_answer in enumerate(parsed_answers):
         image = images[i]
@@ -61,9 +61,7 @@ def process_batch(images: list, masks: list, model_manager: ModelManager):
     config = Config(ldm_steps=50, ldm_sampler=LDMSampler.ddim, hd_strategy=HDStrategy.CROP)
     np_images = [np.array(img) for img in images]
     np_masks = [np.array(mask) for mask in masks]
-    
     results = [model_manager(image, mask, config) for image, mask in zip(np_images, np_masks)]
-    
     pil_results = []
     for result in results:
         if result.dtype in [np.float64, np.float32]:
@@ -80,7 +78,6 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     if not cap.isOpened():
         logger.error(f"Error opening video file: {input_path}")
         return
-
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -91,7 +88,6 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
-
     frame_batch = []
     with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
         while cap.isOpened():
@@ -100,25 +96,19 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
                 frame_batch.append(pil_image)
-            
             if len(frame_batch) == batch_size or (not ret and len(frame_batch) > 0):
                 mask_batch = get_watermark_masks_batch(frame_batch, florence_model, florence_processor, device, max_bbox_percent)
                 result_batch = process_batch(frame_batch, mask_batch, model_manager)
-                
                 for result_image in result_batch:
                     frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
                     out.write(frame_result)
-                
                 pbar.update(len(frame_batch))
                 frame_batch = []
-                torch.cuda.empty_cache() # Clear cache after each batch
-            
+                torch.cuda.empty_cache()
             if not ret:
                 break
-
     cap.release()
     out.release()
-    
     try:
         logger.info("Merging video with original audio...")
         ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(temp_video_path), "-i", str(input_path), "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_file)]
@@ -128,7 +118,6 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
         shutil.copy(str(temp_video_path), str(output_file))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
     logger.info(f"Processing complete. Output saved to: {output_file}")
     return output_file
 
@@ -144,18 +133,15 @@ def main(input_path: str, output_path: str, model: str, max_bbox_percent: float,
     output_path = Path(output_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
-
     florence_model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True).to(device).eval()
     florence_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True)
     logger.info("Florence-2 Model loaded")
-
     model_manager = ModelManager(name=model, device=device)
     logger.info(f"{model.capitalize()} model loaded")
-
     if is_video_file(input_path):
         process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, max_bbox_percent, force_format, batch_size)
     else:
-        logger.error("This script is configured for video processing only. Image processing logic has been removed for clarity.")
+        logger.error("This script is configured for video processing only.")
         sys.exit(1)
 
 if __name__ == "__main__":
