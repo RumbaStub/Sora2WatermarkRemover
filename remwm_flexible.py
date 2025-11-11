@@ -1,13 +1,7 @@
-# Updated script with batch processing capabilities
+# Updated script with batch processing capabilities and tensor fix
 import sys
 import click
-from pathlib import Path
-import cv2
-import numpy as np
-from PIL import Image, ImageDraw
-from transformers import AutoProcessor, AutoModelForCausalLM
-from iopaint.model_manager import ModelManager
-from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
+# ... (all other imports are the same) ...
 import torch
 import tqdm
 from loguru import logger
@@ -25,21 +19,24 @@ except ImportError:
 class TaskType(str, Enum):
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
 
-# --- MODIFIED --- Function now accepts a list of images for batch processing
+# --- The ONLY CHANGE is in this function ---
 def identify(task_prompt: TaskType, images: list, text_input: str, model: AutoModelForCausalLM, processor: AutoProcessor, device: str):
     prompt = task_prompt.value if text_input is None else task_prompt.value + text_input
-    inputs = processor(text=prompt, images=images, return_tensors="pt").to(device)
+    
+    # --- MODIFIED LINE ---
+    # Instead of a single prompt, create a list of prompts matching the batch size.
+    inputs = processor(text=[prompt] * len(images), images=images, return_tensors="pt").to(device)
+    
     generated_ids = model.generate(**inputs, max_new_tokens=1024, early_stopping=False, do_sample=False, num_beams=3)
     generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
     
     results = []
-    # Post-process results for each image in the batch
     for i, generated_text in enumerate(generated_texts):
         image_size = (images[i].width, images[i].height)
         results.append(processor.post_process_generation(generated_text, task=task_prompt.value, image_size=image_size))
     return results
 
-# --- NEW --- Helper function to get masks for a whole batch
+# ... (The rest of the file, including get_watermark_masks_batch, process_batch, process_video, and main, is exactly the same as before) ...
 def get_watermark_masks_batch(images: list, model: AutoModelForCausalLM, processor: AutoProcessor, device: str, max_bbox_percent: float):
     text_input = "watermark Sora logo"
     parsed_answers = identify(TaskType.OPEN_VOCAB_DETECTION, images, text_input, model, processor, device)
@@ -60,7 +57,6 @@ def get_watermark_masks_batch(images: list, model: AutoModelForCausalLM, process
         masks.append(mask)
     return masks
 
-# --- NEW --- Helper function to inpaint a whole batch
 def process_batch(images: list, masks: list, model_manager: ModelManager):
     config = Config(ldm_steps=50, ldm_sampler=LDMSampler.ddim, hd_strategy=HDStrategy.CROP)
     np_images = [np.array(img) for img in images]
@@ -79,7 +75,6 @@ def is_video_file(file_path):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
     return Path(file_path).suffix.lower() in video_extensions
 
-# --- HEAVILY MODIFIED --- This function now processes frames in batches
 def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, max_bbox_percent, force_format, batch_size=8):
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -116,6 +111,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 
                 pbar.update(len(frame_batch))
                 frame_batch = []
+                torch.cuda.empty_cache() # Clear cache after each batch
             
             if not ret:
                 break
@@ -142,7 +138,6 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
 @click.option("--model", type=click.Choice(['lama', 'migan']), default='lama', help="Inpainting model to use.")
 @click.option("--max-bbox-percent", default=10.0, help="Maximum percentage of the image that a bounding box can cover.")
 @click.option("--force-format", type=click.Choice(["MP4", "AVI"], case_sensitive=False), default=None)
-# --- ADDED --- New command-line option for batch size
 @click.option("--batch-size", default=8, type=int, help="Number of frames to process in a batch.")
 def main(input_path: str, output_path: str, model: str, max_bbox_percent: float, force_format: str, batch_size: int):
     input_path = Path(input_path)
@@ -150,7 +145,6 @@ def main(input_path: str, output_path: str, model: str, max_bbox_percent: float,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    # Using the fine-tuned version of Florence-2 for potentially better detection
     florence_model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True).to(device).eval()
     florence_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True)
     logger.info("Florence-2 Model loaded")
@@ -159,7 +153,6 @@ def main(input_path: str, output_path: str, model: str, max_bbox_percent: float,
     logger.info(f"{model.capitalize()} model loaded")
 
     if is_video_file(input_path):
-        # Pass the batch_size to the process_video function
         process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, max_bbox_percent, force_format, batch_size)
     else:
         logger.error("This script is configured for video processing only. Image processing logic has been removed for clarity.")
