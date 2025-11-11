@@ -1,7 +1,4 @@
-
-# This is the full script with our modifications.
-# Running this cell will save the script as 'remwm_flexible.py' in your Colab environment.
-
+# Updated script with batch processing capabilities
 import sys
 import click
 from pathlib import Path
@@ -12,7 +9,6 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 from iopaint.model_manager import ModelManager
 from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import torch
-from torch.nn import Module
 import tqdm
 from loguru import logger
 from enum import Enum
@@ -28,321 +24,146 @@ except ImportError:
 
 class TaskType(str, Enum):
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
-    """Detect bounding box for objects and OCR text"""
 
-def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: AutoModelForCausalLM, processor: AutoProcessor, device: str):
-    if not isinstance(task_prompt, TaskType):
-        raise ValueError(f"task_prompt must be a TaskType, but {task_prompt} is of type {type(task_prompt)}")
-
+# --- MODIFIED --- Function now accepts a list of images for batch processing
+def identify(task_prompt: TaskType, images: list, text_input: str, model: AutoModelForCausalLM, processor: AutoProcessor, device: str):
     prompt = task_prompt.value if text_input is None else task_prompt.value + text_input
-    inputs = processor(text=prompt, images=image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs = processor(text=prompt, images=images, return_tensors="pt").to(device)
+    generated_ids = model.generate(**inputs, max_new_tokens=1024, early_stopping=False, do_sample=False, num_beams=3)
+    generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+    
+    results = []
+    # Post-process results for each image in the batch
+    for i, generated_text in enumerate(generated_texts):
+        image_size = (images[i].width, images[i].height)
+        results.append(processor.post_process_generation(generated_text, task=task_prompt.value, image_size=image_size))
+    return results
 
-    generated_ids = model.generate(
-        input_ids=inputs["input_ids"],
-        pixel_values=inputs["pixel_values"],
-        max_new_tokens=1024,
-        early_stopping=False,
-        do_sample=False,
-        num_beams=3,
-    )
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-    return processor.post_process_generation(
-        generated_text, task=task_prompt.value, image_size=(image.width, image.height)
-    )
-
-def get_watermark_mask(image: MatLike, model: AutoModelForCausalLM, processor: AutoProcessor, device: str, max_bbox_percent: float):
+# --- NEW --- Helper function to get masks for a whole batch
+def get_watermark_masks_batch(images: list, model: AutoModelForCausalLM, processor: AutoProcessor, device: str, max_bbox_percent: float):
     text_input = "watermark Sora logo"
-    task_prompt = TaskType.OPEN_VOCAB_DETECTION
-    parsed_answer = identify(task_prompt, image, text_input, model, processor, device)
+    parsed_answers = identify(TaskType.OPEN_VOCAB_DETECTION, images, text_input, model, processor, device)
 
-    mask = Image.new("L", image.size, 0)
-    draw = ImageDraw.Draw(mask)
+    masks = []
+    for i, parsed_answer in enumerate(parsed_answers):
+        image = images[i]
+        mask = Image.new("L", image.size, 0)
+        draw = ImageDraw.Draw(mask)
+        detection_key = "<OPEN_VOCABULARY_DETECTION>"
+        if detection_key in parsed_answer and "bboxes" in parsed_answer[detection_key]:
+            image_area = image.width * image.height
+            for bbox in parsed_answer[detection_key]["bboxes"]:
+                x1, y1, x2, y2 = map(int, bbox)
+                bbox_area = (x2 - x1) * (y2 - y1)
+                if (bbox_area / image_area) * 100 <= max_bbox_percent:
+                    draw.rectangle([x1, y1, x2, y2], fill=255)
+        masks.append(mask)
+    return masks
 
-    detection_key = "<OPEN_VOCABULARY_DETECTION>"
-    if detection_key in parsed_answer and "bboxes" in parsed_answer[detection_key]:
-        image_area = image.width * image.height
-        for bbox in parsed_answer[detection_key]["bboxes"]:
-            x1, y1, x2, y2 = map(int, bbox)
-            bbox_area = (x2 - x1) * (y2 - y1)
-            if (bbox_area / image_area) * 100 <= max_bbox_percent:
-                draw.rectangle([x1, y1, x2, y2], fill=255)
-            else:
-                logger.warning(f"Skipping large bounding box: {bbox} covering {bbox_area / image_area:.2%} of the image")
-
-    return mask
-
-def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelManager):
-    config = Config(
-        ldm_steps=50,
-        ldm_sampler=LDMSampler.ddim,
-        hd_strategy=HDStrategy.CROP,
-        hd_strategy_crop_margin=64,
-        hd_strategy_crop_trigger_size=800,
-        hd_strategy_resize_limit=1600,
-    )
-    result = model_manager(image, mask, config)
-
-    if result.dtype in [np.float64, np.float32]:
-        result = np.clip(result, 0, 255).astype(np.uint8)
-
-    return result
-
-def make_region_transparent(image: Image.Image, mask: Image.Image):
-    image = image.convert("RGBA")
-    mask = mask.convert("L")
-    transparent_image = Image.new("RGBA", image.size)
-    for x in range(image.width):
-        for y in range(image.height):
-            if mask.getpixel((x, y)) > 0:
-                transparent_image.putpixel((x, y), (0, 0, 0, 0))
-            else:
-                transparent_image.putpixel((x, y), image.getpixel((x, y)))
-    return transparent_image
+# --- NEW --- Helper function to inpaint a whole batch
+def process_batch(images: list, masks: list, model_manager: ModelManager):
+    config = Config(ldm_steps=50, ldm_sampler=LDMSampler.ddim, hd_strategy=HDStrategy.CROP)
+    np_images = [np.array(img) for img in images]
+    np_masks = [np.array(mask) for mask in masks]
+    
+    results = [model_manager(image, mask, config) for image, mask in zip(np_images, np_masks)]
+    
+    pil_results = []
+    for result in results:
+        if result.dtype in [np.float64, np.float32]:
+            result = np.clip(result, 0, 255).astype(np.uint8)
+        pil_results.append(Image.fromarray(result))
+    return pil_results
 
 def is_video_file(file_path):
-    """Check if the file is a video based on its extension"""
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
     return Path(file_path).suffix.lower() in video_extensions
 
-def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, frame_step=1, target_fps=0.0):
-    """Process a video file by extracting frames, removing watermarks, and reconstructing the video"""
+# --- HEAVILY MODIFIED --- This function now processes frames in batches
+def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, max_bbox_percent, force_format, batch_size=8):
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         logger.error(f"Error opening video file: {input_path}")
         return
 
-    # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS)
-    fps_out = target_fps if target_fps > 0 else fps
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    else:
-        output_format = "MP4"  # Default to MP4 for videos
-
-    # Create output video file
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
-    else:
-        output_file = output_path.with_suffix(f".{output_format.lower()}")
-
-    # Créer un fichier temporaire pour la vidéo sans audio
+    output_format = force_format.upper() if force_format else "MP4"
+    output_file = Path(output_path).with_suffix(f".{output_format.lower()}")
     temp_dir = tempfile.mkdtemp()
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
-    # Set codec based on output format
-    if output_format.upper() == "MP4":
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    elif output_format.upper() == "AVI":
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to MP4
-
-    out = cv2.VideoWriter(str(temp_video_path), fourcc, fps_out, (width, height))
-
-    # Process each frame
+    frame_batch = []
     with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
-        frame_count = 0
-        frame_idx = 0
         while cap.isOpened():
             ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+                frame_batch.append(pil_image)
+            
+            if len(frame_batch) == batch_size or (not ret and len(frame_batch) > 0):
+                mask_batch = get_watermark_masks_batch(frame_batch, florence_model, florence_processor, device, max_bbox_percent)
+                result_batch = process_batch(frame_batch, mask_batch, model_manager)
+                
+                for result_image in result_batch:
+                    frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
+                    out.write(frame_result)
+                
+                pbar.update(len(frame_batch))
+                frame_batch = []
+            
             if not ret:
                 break
 
-            # Frame skip control
-            if frame_idx % frame_step != 0:
-                frame_idx += 1
-                pbar.update(1)
-                progress = int((frame_idx / total_frames) * 100)
-                print(f"Processing frame {frame_idx}/{total_frames}, progress:{progress}%")
-                continue
-
-            # Convert frame to PIL Image
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame_rgb)
-
-            # Get watermark mask
-            mask_image = get_watermark_mask(pil_image, florence_model, florence_processor, device, max_bbox_percent)
-
-            # Process frame
-            if transparent:
-                # For video, we can't use transparency, so we'll fill with a color or background
-                result_image = make_region_transparent(pil_image, mask_image)
-                # Convert RGBA to RGB by filling transparent areas with white
-                background = Image.new("RGB", result_image.size, (255, 255, 255))
-                background.paste(result_image, mask=result_image.split()[3])
-                result_image = background
-            else:
-                lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
-                result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-
-            # Convert back to OpenCV format and write to output video
-            frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
-            out.write(frame_result)
-
-            # Update progress
-            frame_count += 1
-            frame_idx += 1
-            pbar.update(1)
-            progress = int((frame_idx / total_frames) * 100)
-            print(f"Processing frame {frame_idx}/{total_frames}, progress:{progress}%")
-
-    # Release resources
     cap.release()
     out.release()
-
-    # Combiner la vidéo traitée avec l'audio original à l'aide de FFmpeg
+    
     try:
-        logger.info("Fusion de la vidéo traitée avec l'audio original...")
-
-        # Vérifier si FFmpeg est disponible
-        try:
-            subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            logger.warning("FFmpeg n'est pas disponible. La vidéo sera produite sans audio.")
-            shutil.copy(str(temp_video_path), str(output_file))
-        else:
-            # Utiliser FFmpeg pour combiner la vidéo traitée avec l'audio original
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(temp_video_path),  # Vidéo traitée sans audio
-                "-i", str(input_path),       # Vidéo originale avec audio
-                "-c:v", "copy",              # Copier la vidéo sans réencodage
-                "-c:a", "aac",               # Encoder l'audio en AAC pour meilleure compatibilité
-                "-map", "0:v:0",             # Utiliser la piste vidéo du premier fichier (vidéo traitée)
-                "-map", "1:a:0",             # Utiliser la piste audio du deuxième fichier (vidéo originale)
-                "-shortest",                  # Terminer quand la piste la plus courte se termine
-                str(output_file)
-            ]
-
-            # Exécuter FFmpeg
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            logger.info("Fusion audio/vidéo terminée avec succès!")
+        logger.info("Merging video with original audio...")
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(temp_video_path), "-i", str(input_path), "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_file)]
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
-        logger.error(f"Erreur lors de la fusion audio/vidéo: {str(e)}")
-        # En cas d'erreur, utiliser la vidéo sans audio
+        logger.error(f"FFmpeg error, saving video without audio: {e}")
         shutil.copy(str(temp_video_path), str(output_file))
     finally:
-        # Nettoyer les fichiers temporaires
-        try:
-            os.remove(str(temp_video_path))
-            os.rmdir(temp_dir)
-        except:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
-    logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+    logger.info(f"Processing complete. Output saved to: {output_file}")
     return output_file
-
-def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, frame_step=1, target_fps=0.0):
-    if output_path.exists() and not overwrite:
-        logger.info(f"Skipping existing file: {output_path}")
-        return
-
-    # Check if it's a video file
-    if is_video_file(image_path):
-        return process_video(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, frame_step, target_fps)
-
-    # Process image
-    image = Image.open(image_path).convert("RGB")
-    mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent)
-
-    if transparent:
-        result_image = make_region_transparent(image, mask_image)
-    else:
-        lama_result = process_image_with_lama(np.array(image), np.array(mask_image), model_manager)
-        result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    elif transparent:
-        output_format = "PNG"
-    else:
-        output_format = image_path.suffix[1:].upper()
-        if output_format not in ["PNG", "WEBP", "JPG"]:
-            output_format = "PNG"
-
-    # Map JPG to JPEG for PIL compatibility
-    if output_format == "JPG":
-        output_format = "JPEG"
-
-    if transparent and output_format == "JPG":
-        logger.warning("Transparency detected. Defaulting to PNG for transparency support.")
-        output_format = "PNG"
-
-    new_output_path = output_path.with_suffix(f".{output_format.lower()}")
-    result_image.save(new_output_path, format=output_format)
-    logger.info(f"input_path:{image_path}, output_path:{new_output_path}")
-    return new_output_path
 
 @click.command()
 @click.argument("input_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path())
-# -------------------- CHANGE 1: ADD NEW --model OPTION --------------------
-@click.option("--model", type=click.Choice(['lama', 'migan']), default='lama', help="Inpainting model to use (lama or migan).")
-@click.option("--overwrite", is_flag=True, help="Overwrite existing files in bulk mode.")
-@click.option("--transparent", is_flag=True, help="Make watermark regions transparent instead of removing.")
+@click.option("--model", type=click.Choice(['lama', 'migan']), default='lama', help="Inpainting model to use.")
 @click.option("--max-bbox-percent", default=10.0, help="Maximum percentage of the image that a bounding box can cover.")
-@click.option("--force-format", type=click.Choice(["PNG", "WEBP", "JPG", "MP4", "AVI"], case_sensitive=False), default=None, help="Force output format. Defaults to input format.")
-@click.option("--frame-step", default=1, type=int, help="Process every Nth frame (1=all frames, 2=every other frame)")
-@click.option("--target-fps", default=0.0, type=float, help="Target output FPS (0=same as input)")
-def main(input_path: str, output_path: str, model: str, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, frame_step: int, target_fps: float):
-    # Input validation
-    if frame_step < 1:
-        logger.error("frame_step must be >= 1")
-        sys.exit(1)
-    if target_fps < 0:
-        logger.error("target_fps must be >= 0")
-        sys.exit(1)
-
+@click.option("--force-format", type=click.Choice(["MP4", "AVI"], case_sensitive=False), default=None)
+# --- ADDED --- New command-line option for batch size
+@click.option("--batch-size", default=8, type=int, help="Number of frames to process in a batch.")
+def main(input_path: str, output_path: str, model: str, max_bbox_percent: float, force_format: str, batch_size: int):
     input_path = Path(input_path)
     output_path = Path(output_path)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    florence_model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True).to(device).eval()
-    florence_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
+    logger.info(f"Using device: {device}")
+
+    # Using the fine-tuned version of Florence-2 for potentially better detection
+    florence_model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True).to(device).eval()
+    florence_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large-ft", trust_remote_code=True)
     logger.info("Florence-2 Model loaded")
 
-    if not transparent:
-        # -------------------- CHANGE 2: USE THE 'model' VARIABLE --------------------
-        model_manager = ModelManager(name=model, device=device)
-        logger.info(f"{model.capitalize()} model loaded")
+    model_manager = ModelManager(name=model, device=device)
+    logger.info(f"{model.capitalize()} model loaded")
+
+    if is_video_file(input_path):
+        # Pass the batch_size to the process_video function
+        process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, max_bbox_percent, force_format, batch_size)
     else:
-        model_manager = None
-
-    if input_path.is_dir():
-        if not output_path.exists():
-            output_path.mkdir(parents=True)
-
-        # Include video files in the search
-        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-        videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov")) + list(input_path.glob("*.mkv"))
-        files = images + videos
-        total_files = len(files)
-
-        for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files")):
-            output_file = output_path / file_path.name
-            handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, frame_step, target_fps)
-            progress = int((idx + 1) / total_files * 100)
-            print(f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress}")
-    else:
-        output_file = output_path
-        if is_video_file(input_path) and output_path.suffix.lower() not in ['.mp4', '.avi', '.mov', '.mkv']:
-            # Ensure video output has proper extension
-            if force_format and force_format.upper() in ["MP4", "AVI"]:
-                output_file = output_path.with_suffix(f".{force_format.lower()}")
-            else:
-                output_file = output_path.with_suffix(".mp4")  # Default to mp4
-
-        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, frame_step, target_fps)
-        print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+        logger.error("This script is configured for video processing only. Image processing logic has been removed for clarity.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
